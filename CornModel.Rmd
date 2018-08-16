@@ -1,0 +1,655 @@
+---
+title: "Modeling Corn Yield by County"
+output:
+  pdf_document: default
+  html_notebook: default
+urlcolor: blue
+---
+```{r,include=FALSE}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=80),tidy=TRUE)
+```
+# Intro
+## I grabbed data from NASS on corn yield to do this and a variety of remotely sensed imagery and other covariates. The point was to do some exploratory data analysis, and examine where obvious avenues would be for improving model fit and prediction. This is ongoing exploration of data.
+
+
+# Resulting Model Predictions and Actual Yield
+
+```{r results='hide', message=FALSE, warning=FALSE,include=FALSE}
+library(sp)
+library(rgdal)
+library(raster)
+library(snow)
+library(parallel)
+library(doParallel)
+library(ggplot2)
+library(rgeos)
+library(caret)
+library(randomForest)
+library(xgboost)
+```
+```{r}
+
+
+county<-readOGR('C:/Users/mhayes1/Desktop/CModel/FinalModelShape.shp',verbose=FALSE)
+spplot(county,'Impute',main='XGBoost Prediction - 2016\nBU/Acre',bty='n',
+       par.settings = list(axis.line = list(col = "transparent")),
+       colorkey = list(axis.line = list(col = "black")))
+
+```
+
+# County Boundaries - Study Area
+
+## First off, we'll get the US county shapefile from the census bureau. We'll download it, unzip it and clip out iowa for processing the rest of our spatial data and to aggregate data to the county level. I'll also grab a state shapefile to clip out the weird artifacts of county boundaries here.
+```{r,echo=TRUE,message=FALSE,fig.align='center',eval=FALSE,tidy=TRUE}
+
+#Download the county boundary file from census bureau
+download.file('ftp://ftp2.census.gov/geo/tiger/TIGER2017/COUNTY/tl_2017_us_county.zip',
+              destfile='C:/Users/mhayes1/Desktop/CModel/County/CountyBound.zip')
+
+#Comes down as a zip file, unzip
+unzip('C:/Users/mhayes1/Desktop/CModel/County/CountyBound.zip',
+      exdir='C:/Users/mhayes1/Desktop/CModel/County')
+
+#Download the state boundary file from census bureau
+download.file('http://www2.census.gov/geo/tiger/GENZ2017/shp/cb_2017_us_state_500k.zip',
+              destfile='C:/Users/mhayes1/Desktop/CModel/StateBound/StateBound.zip')
+
+#Comes down as a zip file, unzip
+unzip('C:/Users/mhayes1/Desktop/CModel/StateBound/StateBound.zip',
+      exdir='C:/Users/mhayes1/Desktop/CModel/StateBound')
+```
+```{r,echo=TRUE,message=FALSE,fig.align='center'}
+
+#read into R as a shapefile
+county<-readOGR('C:/Users/mhayes1/Desktop/CModel/County/tl_2017_us_county.shp',
+                stringsAsFactors = F,verbose=F)
+
+state<-readOGR('C:/Users/mhayes1/Desktop/CModel/StateBound/cb_2017_us_state_500k.shp',
+               stringsAsFactors = F,verbose=F)
+
+#Going to use albers equal area projection, good choice for this extent to minizmize spatial distortion
+projectProjection<-'+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0'
+
+#Reduce the counties to our study area. Manually selecting counties since i don't have a "study area" file
+#Basically, same counties as: https://granular.ag/accounting-by-soil-type-update/
+SA<-county[county$STATEFP %in% c(38,46,31,20,40,27,19,29,55,17,18,39,21,47,37,51,54,26,24,10,34,42,9,36,44,25,33,50,23),]
+
+#Transform the counties into study projection
+SA<-spTransform(SA,projectProjection)
+
+#Grab only the states that are in the study area
+state<-state[state$STATEFP %in% SA$STATEFP,]
+#Transfrom the state into study projectin
+state<-spTransform(state,projectProjection)
+
+#Use raster package crop function to clean up the boundaries in the Study Area file
+SA<-crop(SA,state)
+
+#Save the SA county boundary
+writeOGR(obj=SA,
+         dsn='C:/Users/mhayes1/Desktop/CModel/ReadySpatial',
+         layer='StudyArea',
+         driver='ESRI Shapefile',
+         overwrite=T)
+#Save the State boundary
+writeOGR(obj=state,
+         dsn='C:/Users/mhayes1/Desktop/CModel/ReadySpatial',
+         layer='StateStudyArea',
+         driver='ESRI Shapefile',
+         overwrite=T)
+
+#plot just Study Area
+plot(SA,main='Project Study Area')
+
+```
+# NASS Data to Model Yield
+
+## We have a study area file that looks good and now we need some data!
+
+## I decided to explore the National Agriculture Statstics Service (NASS) Quick Stats site (https://quickstats.nass.usda.gov/). Here, I accessed Survey data for Corn at the county level. Turns out that NASS has an API with HTTP GET and JSON access. I created a function that builds the appropriate queries; the NASS site restricts downloads so you have to download lots of small pieces. So I make a list of every county, create the function and then use a parallel lapply call to speed up the work.
+
+```{r,tidy=TRUE,eval=FALSE}
+#We are going to download data by state/county FIPS, so get all of them
+downvec<-unique(SA$GEOID)
+
+#We'll do an lapply to download all of the data
+#convert downvec to a list. 1,871 counties worth of data.
+downvec<-as.list(downvec)
+
+#create a function to download the data
+NASSDown<-function(x){
+
+  #Attempt to download the data, if download fails, return NULL
+  intdat<-tryCatch(
+          {
+            path<-paste0('https://quickstats.nass.usda.gov/api/api_GET/?key=8DC4E243-37AB-385D-9F74-0527D31CB310&commodity_desc=CORN&year__GE=2008&statisticcat_desc=YIELD&CORN,%20GRAIN%20-%20YIELD,%20MEASURED%20IN%20BU%20/%20ACRE&county_code=',
+                         substr(x,3,5),
+                         '&state_fips_code=',
+                         substr(x,1,2),
+                         '&format=json')
+  
+            #Download Data via API from NASS
+            intdat<-jsonlite::fromJSON(path)[[1]]
+            },
+          error=function(cond) {
+            return(NULL)
+            },
+          warning=function(cond) {
+            return(NULL)
+            }
+          )
+  #return whatever data was grabbed
+  return(intdat)
+}
+
+
+#I am impatient and not using much bandwidth with these small API requests, so I cluster to speed up.
+
+cl <- makeCluster(15, type = "SOCK")
+# Parallelize NASSDown function
+#Nice! Only takes 132 seconds! Probably saved about 18 minutes.
+system.time(ddown <- parLapply(cl = cl, downvec,NASSDown))
+
+# close the cluster
+stopCluster(cl)
+
+#Rbind everything into a data.frame
+ddown<-do.call('rbind',ddown)
+
+#subset data and fix the column names
+ddown<-ddown[,c(2,27,7,39,18,16,33)]
+names(ddown)<-c('State','StateFips','CountyFips','Year','Yield','VarDesc','Units')
+
+#we get a few pieces of information but i just want to model yield in bu/acre
+ddown<-ddown[ddown$VarDesc=='CORN, GRAIN - YIELD, MEASURED IN BU / ACRE',]
+```
+```{r}
+ddown<-read.csv('C:/Users/mhayes1/Desktop/CModel/YieldData.csv',stringsAsFactors = F)
+#just take a quick look at the data
+agg<-aggregate(as.numeric(ddown$Yield)~ddown$State+ddown$Year,FUN=mean)
+names(agg)<-c('State','Year','Yield')
+
+
+ggplot(data = agg, aes(x = Year, y = Yield, group=State,colour = State)) +       
+  geom_line()
+
+head(ddown)
+
+write.csv(ddown,'C:/Users/mhayes1/Desktop/CModel/YieldData.csv',row.names = F)
+```
+# Spatial Covariate Preparation
+
+## So, I have yield data at the county level but now I need some covariates. I grabbed all the covariates from: https://phenology.cr.usgs.gov/get_data_250e.php. These data are various metrics associated with photosynthesis and are prepackaged so easy to use. I'll use the to test things. 
+
+## I ended up pushing this to my workstation. It took 16 hours with 81 cores (and there were 81 rasters). Need some optimization thinking here in future.
+```{r,eval=F,tidy=TRUE}
+
+#list the rasters
+llist<-list.files('/home/puma/Desktop/CModel/Rasters/',pattern='.tif',full.names=T)
+
+
+#create empty list that will be raster stack to mosaic on
+inras<-list()
+
+#List the rasters
+for(i in 1:length(llist)){
+  inras[[i]]<-raster(llist[i])
+}
+ 
+#Project the study area boundary (county boundaries) into raster projection.
+ext<-spTransform(county,proj4string(inras[[1]]))
+
+#function to extract the mean and sd. This will do so for each county.
+rastExt<-function(x,shp){
+  ext2<-extract(x,shp,fun=mean,df=T,na.rm=T)
+  ext3<-extract(x,shp,fun=sd,df=T,na.rm=T)
+  return(list(ext2,ext3))
+}
+
+
+
+#have to love being able to use FORKing on unix systems!
+
+#takes 16 hours!
+system.time( extExtract<-mclapply(inras, FUN=rastExt,shp=ext,mc.cores=81) )
+
+#create output datasets
+meanout<-data.frame()
+sdout<-data.frame()
+
+#deal with all of the datasets and bind together
+for(i in 1:length(extExtract)){
+  sub<-extExtract[[i]]
+  #names(sub[[1]])<-c('ID',)
+  if(i == 1){
+  meanout<-rbind(meanout,sub[[1]])
+  sdout<-rbind(sdout,sub[[2]])
+  }
+  if(i>1){
+  meanout<-cbind(meanout,sub[[1]][,2])
+  names(meanout)[ncol(meanout)]<-names(sub[[1]][2])
+  sdout<-cbind(sdout,sub[[2]][,2]) 
+  names(sdout)[ncol(sdout)]<-names(sub[[2]][2])
+  }
+}
+
+#Append the data to the bounty data
+county@data<-cbind(county@data,meanout,sdout)
+ 
+#This function is ugly. Basically, the output here is a disgusting data frame and nothing is matched up by year (all the covariates vary by year) and the output data that I "cleaned" into something useable is a wide table that isn't organized by year. So, we create a function to append the data in a clean way to our model ready data. We pass an index starting position to start grabbing the data.
+
+#Horrible function but works. Needs fixing.
+chfun<-function(ddown,county,start){
+  county<-county[county@data$COUNTYFP==ddown['CountyFips'],]
+         return(ifelse(ddown['Year'] == '2008',county@data[,start],
+                ifelse(ddown['Year'] == '2009',county@data[,(start+1)],
+                ifelse(ddown['Year'] == '2010',county@data[,(start+2)],
+                ifelse(ddown['Year'] == '2011',county@data[,(start+3)],
+                ifelse(ddown['Year'] == '2012',county@data[,(start+4)],
+                ifelse(ddown['Year'] == '2013',county@data[,(start+5)],
+                ifelse(ddown['Year'] == '2014',county@data[,(start+6)],
+                ifelse(ddown['Year'] == '2015',county@data[,(start+7)],
+                ifelse(ddown['Year'] == '2016',county@data[,(start+8)],
+                                                        99999))))))))))
+
+}
+
+#append cleaned data to our dataset
+ddown$Amp<-apply(ddown,1,FUN=chfun,county=county,start=19)
+ddown$Dur<-apply(ddown,1,FUN=chfun,county=county,start=28)
+ddown$EOSN<-apply(ddown,1,FUN=chfun,county=county,start=37)
+ddown$EOST<-apply(ddown,1,FUN=chfun,county=county,start=46)
+ddown$MAXN<-apply(ddown,1,FUN=chfun,county=county,start=55)
+ddown$MAXT<-apply(ddown,1,FUN=chfun,county=county,start=64)
+ddown$SOSN<-apply(ddown,1,FUN=chfun,county=county,start=73)
+ddown$SOST<-apply(ddown,1,FUN=chfun,county=county,start=82)
+ddown$TIN<-apply(ddown,1,FUN=chfun,county=county,start=91)
+
+ddown$AmpSD<-apply(ddown,1,FUN=chfun,county=county,start=101)
+ddown$DurSD<-apply(ddown,1,FUN=chfun,county=county,start=110)
+ddown$EOSNSD<-apply(ddown,1,FUN=chfun,county=county,start=119)
+ddown$EOSTSD<-apply(ddown,1,FUN=chfun,county=county,start=128)
+ddown$MAXNSD<-apply(ddown,1,FUN=chfun,county=county,start=137)
+ddown$MAXTSD<-apply(ddown,1,FUN=chfun,county=county,start=146)
+ddown$SOSNSD<-apply(ddown,1,FUN=chfun,county=county,start=155)
+ddown$SOSTSD<-apply(ddown,1,FUN=chfun,county=county,start=164)
+ddown$TINSD<-apply(ddown,1,FUN=chfun,county=county,start=173)  
+  
+#save the data!
+write.csv(ddown,'/home/puma/Desktop/CModel/ModelReadyData.csv',row.names=F)
+
+```
+
+```{r,tidy=TRUE}
+dat<-read.csv('C:/Users/mhayes1/Desktop/CModel/ModelReadyData.csv',stringsAsFactors = F)
+#take a quick look
+head(dat)
+```
+
+# County Geoposition
+
+## Getting close!
+## Ok. We have data that is mostly ready to go. I wanted to add the centroid easting/northing for each county and add as covariates. Basically, use the autocorrelation to help us model! This is still debated in ecology but I tend to try to do things this way.
+
+## On the raster processing, turns out that the Raster package does a raster::crop to the raster dataset using the individual polygons, then rasterizes the polygon to calculate the overlap. Crop is slow and, essentially we are doing 1,871 crops of each raster because we have that many counties. Mask would be a far quicker approach most likely. raster::mask just sets anything not in the polygon to NA and is quick. We could then simply calculate the value from that raster for each county. Interesting; I have never looked at the details of the raster::extract function before.
+### getMethod("extract" , signature = c( x = "Raster" , y = "SpatialPolygons"))
+
+```{r,tidy=TRUE}
+#read in the "ready" data
+dat<-read.csv('C:/Users/mhayes1/Desktop/CModel/ModelReadyData.csv',stringsAsFactors = F)
+
+#read in the county study area
+county<-readOGR('C:/Users/mhayes1/Desktop/CModel/ReadySpatial/StudyArea.shp',stringsAsFactors = F)
+
+#use rgeos to grab the centroid for each county
+cents<-as.data.frame(rgeos::gCentroid(county,byid=T))
+
+#add the coordinates to the county file
+county$XCent<-cents[,1]
+county$YCent<-cents[,2]
+
+#rgeos has lots of spatial functions
+
+#this function is going to calculate the ten nearest counties. I had ideas of doing a few different
+#things with this. In the end, I used it to impute missing predictions because there were quite a few.
+distFun<-function(x1,all){
+  #convert from spatialpolygons to df
+  x1<-as.data.frame(x1)
+  all<-as.data.frame(all)
+  
+  #convert to spatial points based on centroid
+  coordinates(x1)<-~XCent+YCent
+  proj4string(x1)<-"+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0"
+  
+  #convert to spatial points based on centroid
+  coordinates(all)<-~XCent+YCent
+  proj4string(all)<-"+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0"
+  
+  #Measure the distance for all other counties from the target
+  all$dists<-as.numeric(gDistance(x1,all,byid=T))
+  
+  #order the distances so most recent is on top
+  all@data<-all@data[order(all@data$dists,decreasing = F),]
+  
+  #grab the top 10 closest, this excludes the target which would have a dist of 0!
+  all<-all[2:11,]
+  
+  #return the geoid's of the top 10
+  return(paste(all$GEOID,collapse=','))
+  
+}
+
+#create the empty column
+county@data$Top10<-NA
+
+#loop through and create this for each county
+for(i in 1:length(county)){
+county@data$Top10[i]<-distFun(county[i,],all=county)
+}
+
+#Merge on FIPS
+county@data$STATEFP<-as.numeric(county@data$STATEFP)
+county@data$COUNTYFP<-as.numeric(county@data$COUNTYFP)
+dat<-merge(dat,county@data[,c(1,2,4,18:20)],by.x=c('StateFips','CountyFips'),by.y=c('STATEFP','COUNTYFP'),all.x=T)
+
+#Save out the correct data
+write.csv(dat,'C:/Users/mhayes1/Desktop/CModel/FinalData.csv',row.names=F)
+```
+
+# What does our data look like
+
+## Quick peak at the data
+
+### This data that I grabbed doesn't have 2017 data. In the routines for binding data together, I used 99999 as a true missing data code. So we'll predict 2016 with 2018-2015.
+```{r}
+dat<-read.csv('C:/Users/mhayes1/Desktop/CModel/FinalData.csv',stringsAsFactors = F)
+
+head(dat)
+```
+
+# Variable Selection
+
+## First, need to do some variable selection. I decided to use random forests to build a full model and then remove the least important variable and run the model over. I record mse/rsq as reported by random forest. I will attempt to minimize mse and maximize rsq given the different variables used. This may not be the best method but I hadn't tried this before so was curious.
+```{r,tidy=TRUE}
+#Given time constraints and me wanting to show something, I'm ignoring the mess of no data for now.
+dat<-dat[complete.cases(dat),]
+
+#our training set will be prior to 2016 and we'll predict to 2016
+train<-dat[dat$Year<2015,]
+test<-dat[dat$Year==2016,]
+
+#these columns are our predictor variables
+nam<-names(train)[c(8:25,27,28)]
+
+ 
+#create output data.frame
+varMod<-data.frame()
+#loop through and create the models
+for(i in 1:19){
+
+#for first model, run the global then start removing variables
+if(i==1){
+rf<-randomForest::randomForest(as.formula(paste('Yield~',(paste(names(train)[c(8:25,27,28)],collapse = ' + ')))),data=train,ntree=100)
+#extract importance and order
+nvars<-rf$importance
+nvars<-nvars[order(nvars),]
+
+#bind the varMod to the new varMod for this model. We record variable names for future use
+varMod<-rbind(varMod,data.frame(nvars=length(names(nvars)),
+                                varNames=paste(names(nvars),collapse=', '),
+                                rsq=rf$rsq[100],
+                                mse=sqrt(rf$mse[100]),stringsAsFactors = F))
+#subset out the variables to drop the worst performer
+nvars<-nvars[2:length(nvars)]
+
+}else{
+  #run the rf model with the new variable set
+  rf<-randomForest::randomForest(as.formula(paste('Yield~',(paste(names(nvars),collapse = ' + ')))),data=train,ntree=100)
+  #extract importance and order
+  nvars<-rf$importance
+  nvars<-nvars[order(nvars),]
+  
+  #bind the varMod to the new varMod for this model. We record variable names for future use
+  varMod<-rbind(varMod,data.frame(nvars=length(names(nvars)),
+                                  varNames=paste(names(nvars),collapse=', '),
+                                  rsq=rf$rsq[100],
+                                  mse=sqrt(rf$mse[100]),stringsAsFactors = F))
+  #subset out the variables to drop the worst performer
+  nvars<-nvars[2:length(nvars)]
+
+}
+}
+
+plot(varMod$nvars,varMod$rsq,main='# Variables Impact on R-Squared',ylab='R-Sq',xlab='# Vars',bty='l',pch=20,type='b')
+plot(varMod$nvars,varMod$mse,main='# Variables Impact on MSE',ylab='MSE',xlab='# Vars',bty='l',pch=20,type='b')
+
+
+```
+
+# Model Building
+
+## So, we'll just grab the model with 10 variables in it and use those variables to fit our models.
+
+## I'm going to create 3 different models. I'll create a linear model, random forest and an optimized XGBoost model. I'll compare them and determine the best performer using RMSE, R-Squared and MAE. I'll impute missing values in the prediction using the 10 nearest counties and plot some results. Bit arbitrary but "optimized" for our purposes. I'll parallel grid search a subset of possible combinations to speed up arriving at a decently optimized output.
+```{r,tidy=TRUE}
+
+#create the linear model
+lm<-lm(as.formula(paste('Yield~',(paste(gsub(' ','',strsplit(varMod$varNames[varMod$nvars==10],',')[[1]]),collapse=' + ')))),data=train)
+
+#create the random forest model
+rf<-randomForest::randomForest(as.formula(paste('Yield~',paste(gsub(' ','',strsplit(varMod$varNames[varMod$nvars==10],',')[[1]]),collapse=' + '))),data=train,ntree=100)
+
+#setup the cross-validation for model optimization
+tcon<-trainControl(method='cv',
+                   number=5,
+                   allowParallel = T)
+
+#create the grid of parameters we'll optimize over
+tuneGrid<-expand.grid(nrounds=c(50,100,150,200),
+                      max_depth=c(8,10,12,14),
+                      eta=c(0.01,0.1,0.2),
+                      gamma=c(0,0.1,0.2),
+                      subsample=c(0.6,0.8,1),
+                      colsample_bytree=c(0.75,0.8,1),
+                      min_child_weight=c(0.75,0.8,1))
+
+#that is just too many, let's subset to only 200 to speed things up. Should arrive at near optimal answer still.
+tuneGrid<-tuneGrid[sample(nrow(tuneGrid),200),]
+
+#register the parallel backend
+
+cl <- makeCluster(8) # convention to leave 1 core for OS
+registerDoParallel(cl)
+
+#Fit the model using the variables previously identified and the parameters defined above.
+finMod<-train(x=as.matrix(train[,gsub(' ','',strsplit(varMod$varNames[varMod$nvars==10],',')[[1]])]),
+                           y=train$Yield,
+                           method='xgbTree',
+                           trControl=tcon,
+                           tuneGrid=tuneGrid)
+
+#stop cluster and de-register the backend
+stopCluster(cl)
+registerDoSEQ()
+
+#Predict results
+test$Pred<-predict(lm,test)
+test$PredRF<-predict(rf,test)
+test$Predxg<-predict(finMod$finalModel,as.matrix(test[,gsub(' ','',strsplit(varMod$varNames[varMod$nvars==10],',')[[1]])]))
+
+#Look at output
+head(finMod$results)
+```
+
+# Model Comparison
+
+## Ok. Models built, let's compare.
+
+```{r,tidy=TRUE}
+#create a dataframe with comparisons
+allres<-data.frame(rbind(postResample(pred = test$Pred, obs = test$Yield),
+                         postResample(pred = test$PredRF, obs = test$Yield),
+                         postResample(pred = test$Predxg, obs = test$Yield)),
+                         stringsAsFactors = F)
+#add model names
+allres$Model<-c('LM','RF','XGBoost')
+
+par(mfrow=c(1,3))
+barplot(allres$RMSE,names.arg =  allres$Model,main='RMSE')
+barplot(allres$Rsquared,names.arg =  allres$Model,main='R-Squared')
+barplot(allres$MAE,names.arg =  allres$Model,main='Mean Absolute Error')
+
+par(mfrow=c(1,1))
+#Look at a lm plot of the xgboost model and the actual yield
+plot(test$Yield,test$Predxg,pch=20,main='XGBoost Model Predictions',xlab='Actual Yield',ylab='Prediction',bty='n')
+abline(lm(test$Yield~test$Predxg),col='blue',lwd=3)
+
+```
+
+# Spatial Model Predictions
+
+## So, the RF and XGBoost models outperformed the linear model. The RF and XGBoost models were very similar though. Looks like the XGBoost model pretty consistently under-predicts yield. Would be interesting to figure out why.
+
+## Let's see how things look spatially. For that, we need to join back up with the county shapefile data.
+
+```{r,tidy=TRUE}
+
+#merge the shapefile with the test results by geoid (concat of state/county fips)
+county<-merge(county,test,by.x='GEOID',by.y='GEOID',all.x=T)
+
+#create a variable of the difference from actual using xgboost model
+county$XGDiff<-county$Predxg/county$Pred
+
+#Plot!
+spplot(county,'Predxg',main='XGBoost Prediction - 2016', 
+       par.settings = list(axis.line = list(col = "transparent")),
+       colorkey = list(axis.line = list(col = "black")))
+spplot(county,'Yield',main='Actual Yield - 2016', 
+       par.settings = list(axis.line = list(col = "transparent")),
+       colorkey = list(axis.line = list(col = "black")))
+
+spplot(county,'XGDiff',main='Yield Accuracy - 2016\nModel divided by Actual\n>1 over predict, <1 under predict', 
+       par.settings = list(axis.line = list(col = "transparent")),
+       colorkey = list(axis.line = list(col = "black")))
+
+```
+
+# Impute Missing Data
+
+## Pretty cool! There are a bunch of missing values, i'll just impute from the median of 10-nearest neighbors. This is really just to make a prettier map and isn't a viable solution for production.
+
+```{r,tidy=TRUE}
+
+#create empty column
+county@data$Impute<-NA
+
+#This should really be a while loop...
+#Loop through twice and impute missing data
+#Need to do twice because there is kind of a lot of missing data in places
+for(k in 1:2){
+  if(k == 1){
+    #loop by county
+    for(i in 1:length(county)){
+      #grab one county at a time
+      sub<-county[i,]
+      #get the list of top ten counties
+      vc<-unlist(strsplit(sub$Top10.x,','))
+      #grab all the data for the top ten counties
+      allother<-county[county@data$GEOID %in% vc,]
+      #Compute the median of the top ten counties
+      county@data$Impute[i]<-ifelse(is.na(sub$Predxg),median(allother$Predxg,na.rm=T),sub$Predxg)
+    
+    }
+  
+  }else{
+    for(i in 1:length(county)){
+      #grab one county at a time
+      sub<-county[i,]
+      #get the list of top ten counties
+      vc<-unlist(strsplit(sub$Top10.x,','))
+      #grab all the data for the top ten counties
+      allother<-county[county@data$GEOID %in% vc,]
+      #Compute the median of the top ten counties
+      county@data$Impute[i]<-ifelse(is.na(sub$Impute),median(allother$Impute,na.rm=T),sub$Impute)
+      
+    }
+  }
+}
+
+#There are a few stragglers, just impute their median from all data
+county@data$Impute<-ifelse(is.na(county@data$Impute),median(county@data$Impute,na.rm=T),county@data$Impute)
+
+#plot it out
+spplot(county,'Impute',main='XGBoost Prediction - 2016\nBU/Acre', 
+       par.settings = list(axis.line = list(col = "transparent")),
+       colorkey = list(axis.line = list(col = "black")))
+
+```
+
+# Corn/Crop Rotation
+
+## Well, that is it. So, what was learned. Many things actually. I ended up looking into the data and learned that corn is crop-rotated about 50% of the time. Meaning in any given year, a field has a 50% chance of coming from another crop to corn or out of corn to another crop. I didn't follow up in the full model for time constraints. I would be curious if yield is dependend on whether the field had been rotated but didn't have time.
+
+```{r}
+
+#Now that corn is coded to 1 in both, let's add them together. A value of 2 will mean that a pixel was corn both years.
+stackmos<-raster('C:/Users/mhayes1/Desktop/Play/CDLCorn2016.img')
+stackmos2<-raster('C:/Users/mhayes1/Desktop/Play/CDLCorn2017.img')
+cal<-stackmos+stackmos2
+cal[!(cal==2)]<-NA
+
+#a value of 0 means it stayed in corn
+#a value of 1 means it was corn and went to something else
+#a value of -1 means it was not corn and went into corn
+cal<-stackmos-stackmos2
+
+```
+# Spatial Patterns of Crop Rotations
+
+## Interesting. Seems as though there are some spatial patterns to crop rotations.
+## Green is Corn -> something else
+## Yellow is Corn -> Corn
+## White is something else -> Corn
+```{r}
+plot(cal,axes=FALSE,box=FALSE)
+```
+```{r}
+#grab all values, faster than in one line as 207mil cells/values
+vals<-values(cal)
+
+#Table of the values and convert to data.frame
+tab<-as.data.frame(table(vals))
+
+#Calculate percentage in each
+tab$Perc<-tab$Freq/sum(tab$Freq)
+
+#Plot it!
+barplot(tab$Perc,names.arg=c('Other->Corn','Corn->Corn','Corn->Other'),ylim=c(0,1),main='Proportion of Cells transitioning into\nor out of Corn from 2016 to 2017',ylab='Percent of Total',xlab='Transition Type')
+```
+
+## Here is a look zoomed in around Delaware County. Appears to be maybe a linear feature running NW/SE? We can also see that individual fields appear to be switching so we likely are seeing an effect of crop rotation; if we could not identify angular features, we might be suspect of the CDL itself.
+```{r}
+
+#read into R as a shapefile
+county<-rgdal::readOGR('C:/Users/mhayes1/Desktop/Play/County/tl_2017_us_county.shp',stringsAsFactors = F,verbose=F)
+
+#Iowa is state 19
+county<-county[county$STATEFP==19,]
+ia<-county[county$NAME=='Delaware',]
+ia<-spTransform(ia,proj4string(cal))
+
+nras<-crop(cal,ia)
+
+plot(nras,axes=FALSE,box=FALSE)
+```
+
+# Final Thoughts
+
+## What else was learned? Well, I was able to account for 50% of the variation at the county level just using high-level pre-processed free data. I think that is decent. Lots of work could be done though, including:
+  + Gather more informative variables
+  + Really examine the variables I grabbed
+  + Perhaps some feature engineering on the variables i grabbed
+  + Soils! I did some iteration with soils but, for time constraints left out of final model
+  + Optimize throughout!
+  
+## This was an interesting start and left lots of questions. I have some other ideas in moving forward with models at higher spatial resolution. I do believe thinking about crop rotation would be key but other variables would also be informative. Soils, drainage, time spent working the field as an indicator of effort needed for that yield would all be interesting. Also, the missing data in the NASS download for yield is not well understood. I would need to delve into what is going on, the API call is clearly asking for those missing areas and I'm getting a return of missing data. There also seem to be a few outliers that need to be dealt with. Carefull inspection of the input data is needed here.
